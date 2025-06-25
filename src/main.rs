@@ -1,59 +1,158 @@
 use nalgebra::Vector3;
+use rayon::prelude::*;
+use std::sync::Arc;
 
-/// Right-hand side of the LLG ODE (unit magnetisation `m`)
-fn llg_rhs(m: &Vector3<f64>,
-           h_eff: &Vector3<f64>,
-           gamma: f64,
-           alpha: f64) -> Vector3<f64>
-{
-    // m × H_eff
-    let mxh     = m.cross(h_eff);
-    // m × (m × H_eff)
-    let mxmxh   = m.cross(&mxh);
+// ---- Zarr stuff -----------------------------------------------------------
+use zarrs::{
+    array::{ArrayBuilder, DataType, FillValue},
+    array_subset::ArraySubset,
+    filesystem::FilesystemStore,
+    group::GroupBuilder,
+    storage::ReadableWritableListableStorage, // <- correct path
+};
+// ---------------------------------------------------------------------------
 
-    // prefactor γ/(1+α²)
-    let pref = -gamma / (1.0 + alpha * alpha);
+/// ---------------- Simulation parameters ----------------
+const N_SPINS: usize = 128; // chain length
+const D: f64 = 2.5e-9; // spacing (m)
+const GAMMA: f64 = 1.760_859e11; // rad s⁻¹ T⁻¹
+const ALPHA: f64 = 0.2; // damping
+const A_EX: f64 = 1.3e-11; // exchange stiffness (J m⁻¹)
+const MU0_MS: f64 = 4.0 * std::f64::consts::PI * 1.0e5; // μ₀Mₛ (≈ 1 T)
 
-    pref * (mxh + alpha * mxmxh)
+const DT: f64 = 1e-14; // time-step (s)
+const N_STEPS: u64 = 50; // #time-steps
+
+/// external field (constant here)
+const H_EXT: Vector3<f64> = Vector3::new(0.0, 0.0, 1.0); // Tesla
+
+/// LLG right-hand side for a single spin
+#[inline(always)]
+fn llg_rhs(m: &Vector3<f64>, h_eff: &Vector3<f64>) -> Vector3<f64> {
+    let mxh = m.cross(h_eff);
+    let mxmxh = m.cross(&mxh);
+    let pref = -GAMMA / (1.0 + ALPHA * ALPHA);
+    pref * (mxh + ALPHA * mxmxh)
 }
 
-/// One fourth-order Runge–Kutta step with optional renormalisation
-fn rk4_step(m: &Vector3<f64>,
-            h_eff: &Vector3<f64>,
-            dt: f64,
-            gamma: f64,
-            alpha: f64) -> Vector3<f64>
-{
-    let k1 = llg_rhs(m,                    h_eff, gamma, alpha);
-    let k2 = llg_rhs(&(m + 0.5*dt*k1),     h_eff, gamma, alpha);
-    let k3 = llg_rhs(&(m + 0.5*dt*k2),     h_eff, gamma, alpha);
-    let k4 = llg_rhs(&(m + dt*k3),         h_eff, gamma, alpha);
-
-    // classical RK-4 update
-    let next = m + (dt/6.0)*(k1 + 2.0*k2 + 2.0*k3 + k4);
-
-    // numerical drift can violate |m|=1 – renormalise explicitly
-    next.normalize()
+/// Exchange field at site *i* (free boundaries)
+fn exchange_field(chain: &[Vector3<f64>], i: usize) -> Vector3<f64> {
+    let m_i = chain[i];
+    let m_ip1 = if i + 1 < chain.len() {
+        chain[i + 1]
+    } else {
+        chain[i]
+    };
+    let m_im1 = if i > 0 { chain[i - 1] } else { chain[i] };
+    let lap = m_ip1 - 2.0 * m_i + m_im1;
+    (2.0 * A_EX / MU0_MS) * lap / (D * D)
 }
 
-fn main() {
-    // ---------- material & simulation parameters ----------
-    let gamma: f64 = 2.211e5;    // (m A⁻¹ s⁻¹)
-    let alpha: f64 = 0.1;        // dimensionless damping
-    let h_eff = Vector3::new(0.0, 0.0, 1.0);   // constant field along +z (Tesla)
+/// One RK4 step for the whole chain
+fn rk4_step(chain: &[Vector3<f64>]) -> Vec<Vector3<f64>> {
+    // k1
+    let k1: Vec<_> = chain
+        .par_iter()
+        .enumerate()
+        .map(|(i, m)| llg_rhs(m, &(H_EXT + exchange_field(chain, i))))
+        .collect();
 
-    let dt   = 1e-12;            // time step (s)
-    let n_steps = 10_000;        // integrate to n_steps*dt
+    // k2
+    let tmp: Vec<_> = chain
+        .iter()
+        .zip(&k1)
+        .map(|(m, k)| m + 0.5 * DT * (*k))
+        .collect();
+    let k2: Vec<_> = tmp
+        .par_iter()
+        .enumerate()
+        .map(|(i, m)| llg_rhs(m, &(H_EXT + exchange_field(&tmp, i))))
+        .collect();
 
-    // ---------- initial state ----------
-    // start 30° away from the field direction
-    let mut m = Vector3::new( (30f64.to_radians()).sin(), 0.0, (30f64.to_radians()).cos() );
+    // k3
+    let tmp: Vec<_> = chain
+        .iter()
+        .zip(&k2)
+        .map(|(m, k)| m + 0.5 * DT * (*k))
+        .collect();
+    let k3: Vec<_> = tmp
+        .par_iter()
+        .enumerate()
+        .map(|(i, m)| llg_rhs(m, &(H_EXT + exchange_field(&tmp, i))))
+        .collect();
+
+    // k4
+    let tmp: Vec<_> = chain.iter().zip(&k3).map(|(m, k)| m + DT * (*k)).collect();
+    let k4: Vec<_> = tmp
+        .par_iter()
+        .enumerate()
+        .map(|(i, m)| llg_rhs(m, &(H_EXT + exchange_field(&tmp, i))))
+        .collect();
+
+    // final update + renormalise
+    chain
+        .iter()
+        .zip(&k1)
+        .zip(&k2)
+        .zip(&k3)
+        .zip(&k4)
+        .map(|((((m, k1), k2), k3), k4)| {
+            let next = *m + (DT / 6.0) * (*k1 + 2.0 * (*k2) + 2.0 * (*k3) + *k4);
+            next.normalize()
+        })
+        .collect()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ---------- initial state: small tilt ----------
+    let tilt = 10f64.to_radians();
+    let mut chain = vec![Vector3::new(tilt.sin(), 0.0, tilt.cos()); N_SPINS];
+
+    // ---------- create Zarr store + dataset ----------
+    let store_path = "magnetization.zarr";
+    let store: ReadableWritableListableStorage = Arc::new(FilesystemStore::new(store_path)?);
+
+    // root group
+    GroupBuilder::new()
+        .build(store.clone(), "/")?
+        .store_metadata()?;
+
+    // shape: (time, z, y, x, vec)  →  (N_STEPS+1, N_SPINS, 1, 1, 3)
+    let shape = vec![(N_STEPS + 1) as u64, 1, 1, N_SPINS as u64, 3];
+    let chunk = vec![1, 1, 1, N_SPINS as u64, 3].try_into().unwrap();
+
+    let array = ArrayBuilder::new(shape, DataType::Float64, chunk, FillValue::from(0.0f64))
+        .build(store.clone(), "/m")?;
+    array.store_metadata()?; // write metadata once
 
     // ---------- time loop ----------
-    for step in 0..=n_steps {
-        let t = step as f64 * dt;
-        println!("{:.3e}\t{:.6e}\t{:.6e}\t{:.6e}", t, m.x, m.y, m.z);
+    for step in 0..=N_STEPS {
+        let t = step as f64 * DT;
 
-        m = rk4_step(&m, &h_eff, dt, gamma, alpha);
+        // ---- write one time slice to Zarr ----
+        let mut flat = Vec::<f64>::with_capacity(N_SPINS * 3);
+        for m in &chain {
+            flat.extend_from_slice(&[m.z, m.y, m.x]); // x, y, z
+        }
+
+        let subset = ArraySubset::new_with_ranges(&[
+            step as u64..step as u64 + 1, // time
+            0..N_SPINS as u64,            // z
+            0..1,                         // y
+            0..1,                         // x
+            0..3,                         // vec
+        ]);
+
+        array.store_array_subset_elements(&subset, &flat)?; // &ArraySubset, &[f64]
+
+        // ---- console output ----
+        if step % 50 == 0 {
+            let m_avg_z = chain.iter().map(|m| m.z).sum::<f64>() / N_SPINS as f64;
+            println!("{:.3e}\t{:.6e}", t, m_avg_z);
+        }
+
+        chain = rk4_step(&chain);
     }
+
+    Ok(())
 }
