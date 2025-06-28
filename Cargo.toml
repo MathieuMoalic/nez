@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 nalgebra = "0.33.2"
 rayon = "1.10.0"
-zarrs = { version = "0.21", default-features = false, features = [
+zarrs = { version = "0.21.2", default-features = false, features = [
     "filesystem",
+    "sharding",
+    "gzip",
 ] }

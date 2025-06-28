@@ -1,10 +1,13 @@
 use nalgebra::Vector3;
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
 // ---- Zarr stuff -----------------------------------------------------------
 use zarrs::{
-    array::{ArrayBuilder, DataType, FillValue},
+    array::{
+        ArrayBuilder, DataType, FillValue, codec::array_to_bytes::sharding::ShardingCodecBuilder,
+        codec::bytes_to_bytes::gzip::GzipCodec,
+    },
     array_subset::ArraySubset,
     filesystem::FilesystemStore,
     group::GroupBuilder,
@@ -110,6 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---------- create Zarr store + dataset ----------
     let store_path = "magnetization.zarr";
+
+    // If the folder already exists, delete it first
+    if std::path::Path::new(store_path).exists() {
+        fs::remove_dir_all(store_path)?;
+    }
+
     let store: ReadableWritableListableStorage = Arc::new(FilesystemStore::new(store_path)?);
 
     // root group
@@ -121,8 +130,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shape = vec![(N_STEPS + 1) as u64, 1, 1, N_SPINS as u64, 3];
     let chunk = vec![1, 1, 1, N_SPINS as u64, 3].try_into().unwrap();
 
+    let mut sharding_codec_builder = ShardingCodecBuilder::new(
+        vec![1, 1, 1, N_SPINS as u64, 3].try_into()?, // inner chunk shape
+    );
+    sharding_codec_builder.bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(5)?)]);
+
     let array = ArrayBuilder::new(shape, DataType::Float64, chunk, FillValue::from(0.0f64))
+        .array_to_bytes_codec(sharding_codec_builder.build_arc())
         .build(store.clone(), "/m")?;
+
     array.store_metadata()?; // write metadata once
 
     // ---------- time loop ----------
@@ -132,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ---- write one time slice to Zarr ----
         let mut flat = Vec::<f64>::with_capacity(N_SPINS * 3);
         for m in &chain {
-            flat.extend_from_slice(&[m.z, m.y, m.x]); // x, y, z
+            flat.extend_from_slice(&[m.x, m.y, m.z]); // x, y, z
         }
 
         let subset = ArraySubset::new_with_ranges(&[
@@ -143,9 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0..3,                         // vec
         ]);
 
-        array.store_array_subset_elements(&subset, &flat)?; // &ArraySubset, &[f64]
+        array.store_array_subset_elements(&subset, &flat)?;
 
-        // ---- console output ----
         if step % 50 == 0 {
             let m_avg_z = chain.iter().map(|m| m.z).sum::<f64>() / N_SPINS as f64;
             println!("{:.3e}\t{:.6e}", t, m_avg_z);
